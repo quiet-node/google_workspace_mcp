@@ -73,6 +73,10 @@ GMAIL_REQUEST_DELAY = 0.1
 # Per-draft subject/recipient/snippet needs one metadata request each, so draft
 # listings stop enriching past this many drafts to keep the request count bounded.
 GMAIL_DRAFT_DETAIL_LIMIT = 25
+# Per-thread subject/participants/message-count/date needs one metadata request
+# each, so thread search results stop enriching past this many threads to keep
+# the request count bounded.
+GMAIL_THREAD_SEARCH_DETAIL_LIMIT = 25
 HTML_BODY_TRUNCATE_LIMIT = 20000
 LOW_VALUE_TEXT_PLACEHOLDERS = (
     "your client does not support html",
@@ -1575,6 +1579,185 @@ async def search_gmail_messages(
     if next_page_token:
         logger.info(
             "[search_gmail_messages] More results available (next_page_token present)"
+        )
+    return formatted_output
+
+
+def _format_gmail_threads_results_plain(
+    thread_entries: List[Dict[str, Any]],
+    query: str,
+    next_page_token: Optional[str] = None,
+) -> str:
+    """Format Gmail thread search results in clean, LLM-friendly plain text."""
+    if not thread_entries:
+        return f"No threads found for query: '{query}'"
+
+    lines = [
+        f"Found {len(thread_entries)} threads matching '{query}':",
+        "",
+        "🧵 THREADS:",
+    ]
+
+    for i, entry in enumerate(thread_entries, 1):
+        thread_id = entry.get("id") or "unknown"
+        thread_url = (
+            _generate_gmail_web_url(thread_id) if thread_id != "unknown" else "N/A"
+        )
+
+        lines.append(f"  {i}. Thread ID: {thread_id}")
+        lines.append(f"     Web Link: {thread_url}")
+
+        analysis = entry.get("analysis")
+        if analysis is None:
+            lines.append(f"     Details: [{entry.get('detail_note', 'not fetched')}]")
+        else:
+            participants = analysis.get("participants") or []
+            lines.append(
+                f"     Subject: {analysis.get('thread_subject') or '(no subject)'}"
+            )
+            lines.append(
+                f"     Participants: {', '.join(participants) if participants else '(none)'}"
+            )
+            lines.append(f"     Messages: {analysis.get('message_count', 0)}")
+            lines.append(
+                f"     Last Message: {analysis.get('last_timestamp') or '(unknown)'}"
+            )
+            lines.append(f"     Snippet: {entry.get('snippet', '')}")
+        lines.append("")
+
+    if len(thread_entries) > GMAIL_THREAD_SEARCH_DETAIL_LIMIT:
+        lines.append(
+            f"Note: subject, participants, message count, and last-message date "
+            f"were fetched for the first {GMAIL_THREAD_SEARCH_DETAIL_LIMIT} threads "
+            "only. Use get_gmail_thread_content for the remaining threads."
+        )
+        lines.append("")
+
+    lines.extend(
+        [
+            "💡 USAGE:",
+            "  • Pass a Thread ID to get_gmail_thread_content() (single) or "
+            "get_gmail_threads_content_batch() (batch) for full message bodies.",
+        ]
+    )
+
+    if next_page_token:
+        lines.append("")
+        lines.append(
+            f"📄 PAGINATION: To get the next page, call search_gmail_threads again with page_token='{next_page_token}'"
+        )
+
+    return "\n".join(lines)
+
+
+@server.tool(
+    title="Search Gmail Threads",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=True,
+    ),
+)
+@handle_http_errors("search_gmail_threads", is_read_only=True, service_type="gmail")
+@require_google_service("gmail", "gmail_read")
+async def search_gmail_threads(
+    service,
+    query: str,
+    user_google_email: str,
+    max_results: int = 10,
+    page_token: Optional[str] = None,
+) -> str:
+    """
+    Searches threads in a user's Gmail account based on a query and returns
+    thread-level results: one entry per matching conversation rather than one
+    per matching message. Each thread is enriched with subject, participants,
+    message count, and the date of its most recent message so a thread whose
+    only match is in an older message, or a thread with several matching
+    messages, is distinguishable from search_gmail_messages' flat message list.
+
+    Subject, participants, message count, and date each require one metadata
+    request per thread, so details are fetched for the first 25 threads only.
+    Any thread past that cap is listed with its ID and snippet alone; use
+    get_gmail_thread_content to inspect it.
+
+    Args:
+        query (str): The search query. Supports standard Gmail search operators.
+        user_google_email (str): The user's Google email address. Required.
+        max_results (int): The maximum number of threads to return. Defaults to 10.
+        page_token (Optional[str]): Token for retrieving the next page of results. Use the next_page_token from a previous response.
+
+    Returns:
+        str: LLM-friendly structured results with Thread IDs, Gmail web interface
+        URLs, subject, participants, message count, most recent message date, and
+        a snippet for each found thread. Includes pagination token if more
+        results are available.
+    """
+    logger.info(
+        f"[search_gmail_threads] Email: '{user_google_email}', Query: '{query}', Max results: {max_results}"
+    )
+
+    request_params = {"userId": "me", "q": query, "maxResults": max_results}
+    if page_token:
+        request_params["pageToken"] = page_token
+        logger.info("[search_gmail_threads] Using page_token for pagination")
+
+    response = await asyncio.to_thread(
+        service.users().threads().list(**request_params).execute
+    )
+
+    if response is None:
+        logger.warning("[search_gmail_threads] Null response from Gmail API")
+        return f"No response received from Gmail API for query: '{query}'"
+
+    threads = response.get("threads") or []
+    next_page_token = response.get("nextPageToken")
+
+    thread_entries: List[Dict[str, Any]] = []
+    for index, thread in enumerate(threads):
+        thread_id = thread.get("id", "")
+        entry: Dict[str, Any] = {
+            "id": thread_id,
+            "snippet": thread.get("snippet", ""),
+            "analysis": None,
+        }
+
+        # Cap the per-thread metadata requests so a large result set cannot
+        # turn one tool call into an unbounded number of Gmail API calls.
+        if index >= GMAIL_THREAD_SEARCH_DETAIL_LIMIT or not thread_id:
+            entry["detail_note"] = "not fetched"
+            thread_entries.append(entry)
+            continue
+
+        try:
+            thread_response = await asyncio.to_thread(
+                service.users()
+                .threads()
+                .get(
+                    userId="me",
+                    id=thread_id,
+                    format="metadata",
+                    metadataHeaders=GMAIL_METADATA_HEADERS,
+                )
+                .execute
+            )
+            entry["analysis"] = _analyze_thread_ownership_impl(
+                thread_response, user_google_email
+            )
+        except HttpError as fetch_error:
+            entry["detail_note"] = f"failed to fetch metadata: {fetch_error}"
+
+        thread_entries.append(entry)
+        await asyncio.sleep(GMAIL_REQUEST_DELAY)
+
+    formatted_output = _format_gmail_threads_results_plain(
+        thread_entries, query, next_page_token
+    )
+
+    logger.info(f"[search_gmail_threads] Found {len(threads)} threads")
+    if next_page_token:
+        logger.info(
+            "[search_gmail_threads] More results available (next_page_token present)"
         )
     return formatted_output
 
