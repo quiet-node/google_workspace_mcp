@@ -3078,7 +3078,9 @@ async def update_gmail_draft(
     again are not preserved. Read the draft with get_gmail_draft first when revising.
     The draft's existing thread is preserved automatically: when thread_id is omitted,
     the thread the draft already belongs to is reused so a reply draft is not detached
-    from its conversation.
+    from its conversation. Missing reply headers are derived from the other messages in
+    that thread; a draft that is alone in its thread is updated as an unthreaded draft,
+    with its subject left exactly as supplied.
 
     Args:
         user_google_email (str): The user's Google email address. Required for authentication.
@@ -3117,18 +3119,31 @@ async def update_gmail_draft(
     )
 
     # drafts.update replaces the draft, so an omitted thread_id would silently pull a
-    # reply draft out of its conversation. Reuse the draft's current thread instead.
-    if not thread_id:
-        existing_draft = await asyncio.to_thread(
-            service.users()
-            .drafts()
-            .get(userId="me", id=draft_id, format="minimal")
-            .execute
-        )
-        thread_id = (existing_draft.get("message") or {}).get("threadId")
+    # reply draft out of its conversation. Read the draft first for both its current
+    # thread and its own Message-ID.
+    existing_draft = await asyncio.to_thread(
+        service.users()
+        .drafts()
+        .get(userId="me", id=draft_id, format="metadata")
+        .execute
+    )
+    existing_message = existing_draft.get("message") or {}
+    existing_headers = _extract_headers(
+        existing_message.get("payload") or {}, GMAIL_METADATA_HEADERS
+    )
+    existing_message_id = existing_headers.get("Message-ID", "")
+    thread_id = thread_id or existing_message.get("threadId")
 
     if thread_id and (not in_reply_to or not references):
-        thread_message_ids = await _fetch_thread_message_ids(service, thread_id)
+        thread_message_ids = [
+            message_id
+            for message_id in await _fetch_thread_message_ids(service, thread_id)
+            # The draft is itself a message in its thread. Deriving reply headers from
+            # the draft would make it reply to itself and would trigger the automatic
+            # "Re:" subject rewrite, so only other messages in the thread count. A
+            # draft that is alone in its thread therefore stays unthreaded on update.
+            if message_id != existing_message_id
+        ]
         in_reply_to, references = _derive_reply_headers(
             thread_message_ids, in_reply_to, references
         )
